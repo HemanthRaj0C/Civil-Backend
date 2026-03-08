@@ -19,6 +19,15 @@ app.get("/", (_req, res) => {
   res.json({ message: "Traffic LOS API is running" });
 });
 
+app.get("/health", (_req, res) => {
+  res.status(200).json({
+    status: "ok",
+    service: "traffic-los-backend",
+    timestamp: new Date().toISOString(),
+    uptimeSeconds: process.uptime(),
+  });
+});
+
 connectDB(MONGODB_URI).then(() => {
   app.listen(PORT, () => {
     console.log(`Server running on port ${PORT}`);
