@@ -1,7 +1,8 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.getRecordById = exports.getAllRecords = exports.analyzeTraffic = void 0;
+exports.analyzeAreaTraffic = exports.getRecordById = exports.getAllRecords = exports.analyzeTraffic = void 0;
 const trafficService_1 = require("../services/trafficService");
+const areaAnalysisService_1 = require("../services/areaAnalysisService");
 const TrafficData_1 = require("../models/TrafficData");
 const analyzeTraffic = async (req, res) => {
     const { location, bike, car, auto, bus, truck, speed } = req.body;
@@ -56,3 +57,23 @@ const getRecordById = async (req, res) => {
     res.json(record);
 };
 exports.getRecordById = getRecordById;
+const analyzeAreaTraffic = async (req, res) => {
+    const { north, south, east, west } = req.body;
+    if (north == null || south == null || east == null || west == null) {
+        res.status(400).json({ error: "Bounding box coordinates (north, south, east, west) are required" });
+        return;
+    }
+    if (north <= south || east <= west) {
+        res.status(400).json({ error: "Invalid bounding box: north must be > south, east must be > west" });
+        return;
+    }
+    try {
+        const result = await (0, areaAnalysisService_1.analyzeArea)({ north, south, east, west });
+        res.json(result);
+    }
+    catch (err) {
+        const message = err instanceof Error ? err.message : "Area analysis failed";
+        res.status(500).json({ error: message });
+    }
+};
+exports.analyzeAreaTraffic = analyzeAreaTraffic;

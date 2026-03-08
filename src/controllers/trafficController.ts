@@ -1,5 +1,6 @@
 import { Request, Response } from "express";
 import { calculatePCU, calculateDensity, calculateLOS } from "../services/trafficService";
+import { analyzeArea } from "../services/areaAnalysisService";
 import { TrafficData } from "../models/TrafficData";
 
 export const analyzeTraffic = async (req: Request, res: Response): Promise<void> => {
@@ -57,4 +58,26 @@ export const getRecordById = async (req: Request, res: Response): Promise<void> 
     return;
   }
   res.json(record);
+};
+
+export const analyzeAreaTraffic = async (req: Request, res: Response): Promise<void> => {
+  const { north, south, east, west } = req.body;
+
+  if (north == null || south == null || east == null || west == null) {
+    res.status(400).json({ error: "Bounding box coordinates (north, south, east, west) are required" });
+    return;
+  }
+
+  if (north <= south || east <= west) {
+    res.status(400).json({ error: "Invalid bounding box: north must be > south, east must be > west" });
+    return;
+  }
+
+  try {
+    const result = await analyzeArea({ north, south, east, west });
+    res.json(result);
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : "Area analysis failed";
+    res.status(500).json({ error: message });
+  }
 };
