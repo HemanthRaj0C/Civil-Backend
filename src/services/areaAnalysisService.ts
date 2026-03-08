@@ -40,7 +40,7 @@ export interface AreaAnalysisResult {
   };
 }
 
-export function generateGridPoints(bounds: BoundingBox, gridSize: number = 5): GridPoint[] {
+export function generateGridPoints(bounds: BoundingBox, gridSize: number = 3): GridPoint[] {
   const points: GridPoint[] = [];
   const latStep = (bounds.north - bounds.south) / gridSize;
   const lngStep = (bounds.east - bounds.west) / gridSize;
@@ -57,7 +57,7 @@ export function generateGridPoints(bounds: BoundingBox, gridSize: number = 5): G
   return points;
 }
 
-export function createRoutePairs(points: GridPoint[], gridSize: number = 5): RoutePair[] {
+export function createRoutePairs(points: GridPoint[], gridSize: number = 3): RoutePair[] {
   const pairs: RoutePair[] = [];
   const cols = gridSize + 1;
 
@@ -101,9 +101,19 @@ async function fetchTravelData(
     const routeDistance = element.distance.value;
     const duration = element.duration_in_traffic?.value || element.duration.value;
 
-    // If route > 3x straight-line, it's routing far away (ocean/no-road)
-    if (routeDistance > straightLine * 3) {
-      return { distance: routeDistance, duration, straightLine, status: `SKIPPED:route_${routeDistance}m_vs_straight_${Math.round(straightLine)}m` };
+    // Skip very short segments (< 40m) — unreliable data
+    if (routeDistance < 40) {
+      return { distance: routeDistance, duration, straightLine, status: "SKIPPED:too_short" };
+    }
+
+    // Skip unrealistic durations (< 2s)
+    if (duration < 2) {
+      return { distance: routeDistance, duration, straightLine, status: "SKIPPED:duration_too_small" };
+    }
+
+    // If route > 2x straight-line, it's routing far away (ocean/no-road)
+    if (routeDistance > straightLine * 2) {
+      return { distance: routeDistance, duration, straightLine, status: `SKIPPED:detour_${routeDistance}m_vs_straight_${Math.round(straightLine)}m` };
     }
 
     return { distance: routeDistance, duration, straightLine, status: "OK" };
@@ -134,31 +144,70 @@ export function computeDensity(averageSpeed: number, estimatedFlow: number = 800
 }
 
 export function computeLOS(averageSpeed: number): string {
-  // Speed-based LOS thresholds for urban streets (HCM method)
-  if (averageSpeed >= 80) return "A";   // Free flow
-  if (averageSpeed >= 50) return "B";   // Reasonably free flow
-  if (averageSpeed >= 35) return "C";   // Stable flow
-  if (averageSpeed >= 25) return "D";   // Approaching unstable
+  // Speed-based LOS thresholds tuned for Indian urban traffic
+  if (averageSpeed >= 50) return "A";   // Free flow
+  if (averageSpeed >= 40) return "B";   // Reasonably free flow
+  if (averageSpeed >= 30) return "C";   // Stable flow
+  if (averageSpeed >= 20) return "D";   // Approaching unstable
   if (averageSpeed >= 15) return "E";   // Unstable / congested
   return "F";                           // Severe congestion / gridlock
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0
+    ? sorted[mid]
+    : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+async function snapToRoads(points: GridPoint[], apiKey: string): Promise<GridPoint[]> {
+  // Snap grid points to nearest roads using Google Roads API
+  const path = points.map(p => `${p.lat},${p.lng}`).join("|");
+  try {
+    const response = await axios.get("https://roads.googleapis.com/v1/nearestRoads", {
+      params: { points: path, key: apiKey },
+    });
+    const snapped = response.data?.snappedPoints;
+    if (!snapped || snapped.length === 0) return points;
+
+    // Map snapped points back by originalIndex
+    const result = [...points];
+    for (const sp of snapped) {
+      const idx = sp.originalIndex;
+      if (idx != null && idx < result.length) {
+        result[idx] = {
+          lat: sp.location.latitude,
+          lng: sp.location.longitude,
+        };
+      }
+    }
+    return result;
+  } catch {
+    // If Roads API fails, fall back to original grid points
+    return points;
+  }
 }
 
 export async function analyzeArea(bounds: BoundingBox): Promise<AreaAnalysisResult> {
   const apiKey = process.env.GOOGLE_API_KEY;
   if (!apiKey) throw new Error("GOOGLE_API_KEY is not configured");
 
-  const gridSize = 5;
-  const points = generateGridPoints(bounds, gridSize);
+  const gridSize = 3;
+  const rawPoints = generateGridPoints(bounds, gridSize);
+  const points = await snapToRoads(rawPoints, apiKey);
   const pairs = createRoutePairs(points, gridSize);
 
   console.log("\n========== AREA ANALYSIS START ==========");
   console.log("Bounding box:", bounds);
   console.log(`Grid points: ${points.length}, Route pairs: ${pairs.length}`);
 
-  const batchSize = 10;
+  const batchSize = 20;
   const speeds: number[] = [];
   const segments: SegmentLog[] = [];
   let skippedCount = 0;
+  let weightedSpeedSum = 0;
+  let totalDistance = 0;
 
   for (let i = 0; i < pairs.length; i += batchSize) {
     const batch = pairs.slice(i, i + batchSize);
@@ -181,7 +230,15 @@ export async function analyzeArea(bounds: BoundingBox): Promise<AreaAnalysisResu
       if (result.status === "OK" && result.distance > 0 && result.duration > 0) {
         const speed = computeSpeed(result.distance, result.duration);
         segLog.speedKmh = parseFloat(speed.toFixed(2));
-        if (speed > 0) speeds.push(speed);
+        // Filter extreme speeds: < 5 km/h or > 120 km/h are unrealistic
+        if (speed >= 5 && speed <= 120) {
+          speeds.push(speed);
+          weightedSpeedSum += speed * result.distance;
+          totalDistance += result.distance;
+        } else {
+          segLog.status = `SKIPPED:extreme_speed_${speed.toFixed(1)}kmh`;
+          skippedCount++;
+        }
       } else {
         skippedCount++;
       }
@@ -192,7 +249,7 @@ export async function analyzeArea(bounds: BoundingBox): Promise<AreaAnalysisResu
 
   console.log(`\nResults: ${speeds.length} valid segments, ${skippedCount} skipped`);
   if (speeds.length > 0) {
-    console.log(`Speeds: min=${Math.min(...speeds).toFixed(1)}, max=${Math.max(...speeds).toFixed(1)}, avg=${(speeds.reduce((a,b)=>a+b,0)/speeds.length).toFixed(1)} km/h`);
+    console.log(`Speeds: min=${Math.min(...speeds).toFixed(1)}, max=${Math.max(...speeds).toFixed(1)}, avg=${(speeds.reduce((a,b)=>a+b,0)/speeds.length).toFixed(1)}, median=${median(speeds).toFixed(1)} km/h`);
   }
   segments.forEach((s, i) => {
     console.log(`  [${i}] ${s.origin} -> ${s.destination} | dist=${s.distanceM}m dur=${s.durationS}s straight=${s.straightLineM}m speed=${s.speedKmh}km/h | ${s.status}`);
@@ -203,9 +260,10 @@ export async function analyzeArea(bounds: BoundingBox): Promise<AreaAnalysisResu
     throw new Error("No routable roads found in the selected area. Try selecting a land area with roads.");
   }
 
-  const averageSpeed = parseFloat(
-    (speeds.reduce((sum, s) => sum + s, 0) / speeds.length).toFixed(2)
-  );
+  // Use distance-weighted speed as primary, median as fallback
+  const averageSpeed = totalDistance > 0
+    ? parseFloat((weightedSpeedSum / totalDistance).toFixed(2))
+    : parseFloat(median(speeds).toFixed(2));
   const density = computeDensity(averageSpeed);
   const los = computeLOS(averageSpeed);
 
